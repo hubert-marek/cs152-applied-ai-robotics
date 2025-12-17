@@ -25,6 +25,13 @@ from kb import (
     OCC,
 )
 
+# Defensive fallback: ensure UNKNOWN exists even if an older/stale version of this
+# file (or a partial import edit) ends up running.
+try:
+    UNKNOWN
+except NameError:
+    UNKNOWN = -1
+
 
 # Maps (dx, dy) to heading constant
 DELTA_TO_HEADING = {

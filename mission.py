@@ -26,6 +26,13 @@ if TYPE_CHECKING:
     from kb import KnowledgeBase
 
 
+# When True, forcibly snap the internal continuous pose estimate to planned grid
+# centers after each waypoint/action. This can mask estimator drift, but if the
+# robot does not physically reach the planned cell it will de-sync pose from
+# LiDAR observations and break box re-detection/push verification.
+SNAP_INTERNAL_POSE = False
+
+
 class MissionController:
     """
     Executes high-level missions using planning algorithms.
@@ -162,8 +169,9 @@ class MissionController:
         # Sync KB to TARGET waypoint (not drifted pose!)
         self.kb.set_robot(x, y, heading)
 
-        # Snap internal pose to grid cell center to prevent drift accumulation
-        self.robot.snap_pose_to_grid(x, y, heading)
+        # Optionally snap internal pose to grid cell center.
+        if SNAP_INTERNAL_POSE:
+            self.robot.snap_pose_to_grid(x, y, heading)
 
         print(
             f"    [DEBUG] KB now at: ({self.kb.robot_x}, {self.kb.robot_y}) h={self.kb.robot_heading}"
@@ -525,7 +533,8 @@ class MissionController:
                         heading_for_kb=current_heading,
                     )
                 self.kb.set_robot(robot_x, robot_y, new_heading)
-                self.robot.snap_pose_to_grid(robot_x, robot_y, new_heading)
+                if SNAP_INTERNAL_POSE:
+                    self.robot.snap_pose_to_grid(robot_x, robot_y, new_heading)
             elif action == "turn_right":
                 # Safety: check if in contact with box before turning
                 if self.robot.is_in_contact_with(self.box_id):
@@ -549,7 +558,8 @@ class MissionController:
                         heading_for_kb=current_heading,
                     )
                 self.kb.set_robot(robot_x, robot_y, new_heading)
-                self.robot.snap_pose_to_grid(robot_x, robot_y, new_heading)
+                if SNAP_INTERNAL_POSE:
+                    self.robot.snap_pose_to_grid(robot_x, robot_y, new_heading)
             elif action == "move_forward":
                 dx, dy = DIRECTION_VECTORS[current_heading]
                 target_x = robot_x + dx
@@ -637,7 +647,8 @@ class MissionController:
 
                 # Update KB robot position to target (trust the plan)
                 self.kb.set_robot(target_x, target_y, current_heading)
-                self.robot.snap_pose_to_grid(target_x, target_y, current_heading)
+                if SNAP_INTERNAL_POSE:
+                    self.robot.snap_pose_to_grid(target_x, target_y, current_heading)
             else:
                 raise ValueError(f"Unknown delivery action: {action}")
 

@@ -484,27 +484,21 @@ class RobotController:
         if dt is None:
             dt = TIME_STEP
 
-        # 1. Get velocity-based distance (use odometry only for direction sign)
-        odom_distance = self._get_distance_traveled()
-        self._reset_odometry()
+        # Integrate base velocities directly.
+        #
+        # Why: The robot can slip laterally (especially while pushing). If we only
+        # integrate a scalar "forward distance" along pose_yaw, we will miss
+        # sideways motion and accumulate large grid errors (observed in logs as
+        # persistent GRID/BOX mismatches).
+        linear_vel, angular_vel = pybullet.getBaseVelocity(self.robot_id)
 
-        speed, angular_vel = self._get_base_velocity()
-        distance_mag = speed * dt
-
-        # Determine direction from odometry sign
-        if abs(odom_distance) > 1e-9:
-            sign = 1.0 if odom_distance > 0 else -1.0
-        else:
-            sign = 1.0
-        distance = sign * distance_mag
-
-        # 2. Update heading from gyroscope
-        self.pose_yaw += angular_vel * dt
+        # 1) Heading from gyroscope (angular velocity around Z)
+        self.pose_yaw += angular_vel[2] * dt
         self.pose_yaw = normalize_angle(self.pose_yaw)
 
-        # 3. Update position
-        self.pose_x += distance * math.cos(self.pose_yaw)
-        self.pose_y += distance * math.sin(self.pose_yaw)
+        # 2) Position in internal/world XY (axes match; internal is a translation)
+        self.pose_x += linear_vel[0] * dt
+        self.pose_y += linear_vel[1] * dt
 
         # NOTE: LiDAR recalibration disabled - was causing more harm than good
 
@@ -771,7 +765,7 @@ class RobotController:
             distance = math.sqrt(dx * dx + dy * dy)
 
             # Check if arrived (within 2% of cell size = 2.5cm)
-            if distance < CELL_SIZE * 0.05:
+            if distance < CELL_SIZE * 0.02:
                 reached = True
                 break
 

@@ -151,8 +151,13 @@ class KnowledgeBase:
             # Ignore obviously-invalid localization results instead of poisoning the KB.
             return
         self.box = (x, y)
-        # We usually treat the box cell as occupied for planning robot paths.
-        self.mark_occupied(x, y)
+        # IMPORTANT: The box is a dynamic object, not a static obstacle.
+        # Do NOT encode it into the occupancy grid, otherwise the box leaves behind
+        # "ghost walls" when it moves. Path planning already treats `self.box` as
+        # non-traversable via `is_traversable()`.
+        #
+        # Mark as FREE so a previously-mistaken OCC does not persist.
+        self.mark_free(x, y)
 
     def move_box(self, new_x: int, new_y: int) -> None:
         """Update box position after a push. Clears old cell, marks new as occupied."""
@@ -163,7 +168,8 @@ class KnowledgeBase:
             old_x, old_y = self.box
             self.mark_free(old_x, old_y)
         self.box = (new_x, new_y)
-        self.mark_occupied(new_x, new_y)
+        # Same rationale as in set_box(): keep dynamic box out of occ grid.
+        self.mark_free(new_x, new_y)
 
     def clear_box(self) -> None:
         """Clear box knowledge (does not modify occupancy)."""
@@ -269,8 +275,10 @@ class KnowledgeBase:
     def mark_free(self, x: int, y: int) -> None:
         if not self.in_bounds(x, y):
             return
-        if self.get_cell(x, y) != OCC:
-            self.occ[(x, y)] = FREE
+        # Allow clearing an OCC cell if later evidence indicates it is free.
+        # (This also prevents "ghost obstacles" if a dynamic object was ever
+        # incorrectly written into occ.)
+        self.occ[(x, y)] = FREE
 
     def mark_occupied(self, x: int, y: int) -> None:
         if not self.in_bounds(x, y):
