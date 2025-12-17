@@ -159,7 +159,7 @@ def _create_walls(room_size: float) -> list[int]:
 
 def _create_box(room_size: float) -> tuple[int, list[float]]:
     """Create pushable box. Returns (box_id, position)."""
-    box_size = 0.20  # 20cm box for compact robot
+    box_size = 0.3  # 20cm box for compact robot
     box_mass = 0.5  # Slightly heavier for more realistic physics
     box_pos = [3.25, 3.25, box_size / 2]
 

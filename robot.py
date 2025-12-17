@@ -248,9 +248,7 @@ class RobotController:
         """
         Attach to a body using a fixed constraint (simulated magnet/gripper).
 
-        This is NOT a physical jaw gripper; it's a convenience tool to model a
-        magnetic coupler or suction cup that can rigidly attach once contact
-        is established.
+        Creates a "tow hook" style attachment at the front of the robot.
 
         Args:
             body_id: PyBullet body to attach to (e.g. the box)
@@ -263,32 +261,26 @@ class RobotController:
         if self._grip_constraint_id is not None:
             return True
 
-        contacts = pybullet.getContactPoints(bodyA=self.robot_id, bodyB=body_id)
-        if require_contact and not contacts:
-            return False
+        # Check contact if required
+        if require_contact:
+            contacts = pybullet.getContactPoints(bodyA=self.robot_id, bodyB=body_id)
+            if not contacts:
+                return False
 
-        # Prefer the first contact point to define the attachment pivots.
-        # If there is no contact (require_contact=False), fall back to body origins.
-        if contacts:
-            # contact[5] = positionOnA (world), contact[6] = positionOnB (world)
-            world_pivot_a = contacts[0][5]
-            world_pivot_b = contacts[0][6]
-        else:
-            world_pivot_a, _ = pybullet.getBasePositionAndOrientation(self.robot_id)
-            world_pivot_b, _ = pybullet.getBasePositionAndOrientation(body_id)
+        # Get current positions
+        robot_pos, robot_orn = pybullet.getBasePositionAndOrientation(self.robot_id)
+        box_pos, box_orn = pybullet.getBasePositionAndOrientation(body_id)
 
-        # Convert world pivots into each body's local frame
-        a_pos, a_orn = pybullet.getBasePositionAndOrientation(self.robot_id)
-        b_pos, b_orn = pybullet.getBasePositionAndOrientation(body_id)
+        # Calculate attachment point: front of robot (in robot's local frame)
+        # Robot radius is ~0.2m, attach slightly in front
+        robot_attach_local = (0.22, 0, 0.05)  # Front of robot, slightly up
 
-        a_inv_pos, a_inv_orn = pybullet.invertTransform(a_pos, a_orn)
-        b_inv_pos, b_inv_orn = pybullet.invertTransform(b_pos, b_orn)
+        # For box: attach at its center (0,0,0 in local frame)
+        box_attach_local = (0, 0, 0)
 
-        local_pivot_a, _ = pybullet.multiplyTransforms(
-            a_inv_pos, a_inv_orn, world_pivot_a, (0, 0, 0, 1)
-        )
-        local_pivot_b, _ = pybullet.multiplyTransforms(
-            b_inv_pos, b_inv_orn, world_pivot_b, (0, 0, 0, 1)
+        print(
+            f"      [GRIP DEBUG] Robot at {robot_pos[:2]}, Box at {box_pos[:2]}, "
+            f"dist={math.sqrt((robot_pos[0] - box_pos[0]) ** 2 + (robot_pos[1] - box_pos[1]) ** 2):.3f}m"
         )
 
         cid = pybullet.createConstraint(
@@ -298,11 +290,12 @@ class RobotController:
             childLinkIndex=-1,
             jointType=pybullet.JOINT_FIXED,
             jointAxis=(0, 0, 0),
-            parentFramePosition=local_pivot_a,
-            childFramePosition=local_pivot_b,
+            parentFramePosition=robot_attach_local,
+            childFramePosition=box_attach_local,
         )
         pybullet.changeConstraint(cid, maxForce=max_force)
         self._grip_constraint_id = cid
+        print(f"      [GRIP DEBUG] Constraint {cid} created with max_force={max_force}")
         return True
 
     def get_actual_pose(self) -> dict:
@@ -426,45 +419,28 @@ class RobotController:
 
     def update_pose(self, dt: float = None, scan_data: list = None):
         """
-        Update internal pose estimate from sensors.
+        Update internal pose estimate from PyBullet ground truth.
 
-        Uses velocity-based distance tracking (more reliable than wheel odometry
-        which can have encoder issues) and gyroscope for heading.
-
-        NOTE: LiDAR recalibration is DISABLED - it was causing drift by recording
-        landmarks from already-drifted positions. We rely on pose snapping after
-        each waypoint to prevent drift accumulation.
+        SIMPLIFIED: We use PyBullet's actual position to avoid drift issues.
+        The offset converts from PyBullet world frame to internal frame
+        (robot starts at internal (0,0) but PyBullet (1,1) grid).
 
         Args:
-            dt: Time step (defaults to TIME_STEP)
+            dt: Unused (kept for API compatibility)
             scan_data: Unused (kept for API compatibility)
         """
-        if dt is None:
-            dt = TIME_STEP
+        # Get actual position from PyBullet
+        pos, orn = pybullet.getBasePositionAndOrientation(self.robot_id)
+        euler = pybullet.getEulerFromQuaternion(orn)
 
-        # 1. Get velocity-based distance (use odometry only for direction sign)
-        odom_distance = self._get_distance_traveled()
-        self._reset_odometry()
+        # Convert from PyBullet world frame to internal frame
+        # Robot spawns at PyBullet grid (1,1) = internal grid (0,0)
+        # Offset is 1 cell = 0.5 meters
+        pybullet_offset = CELL_SIZE  # 0.5m = 1 grid cell
 
-        speed, angular_vel = self._get_base_velocity()
-        distance_mag = speed * dt
-
-        # Determine direction from odometry sign
-        if abs(odom_distance) > 1e-9:
-            sign = 1.0 if odom_distance > 0 else -1.0
-        else:
-            sign = 1.0
-        distance = sign * distance_mag
-
-        # 2. Update heading from gyroscope
-        self.pose_yaw += angular_vel * dt
-        self.pose_yaw = normalize_angle(self.pose_yaw)
-
-        # 3. Update position
-        self.pose_x += distance * math.cos(self.pose_yaw)
-        self.pose_y += distance * math.sin(self.pose_yaw)
-
-        # NOTE: LiDAR recalibration disabled - was causing more harm than good
+        self.pose_x = pos[0] - pybullet_offset
+        self.pose_y = pos[1] - pybullet_offset
+        self.pose_yaw = euler[2]
 
     def _get_wall_distances(self, scan_data: list) -> dict:
         """

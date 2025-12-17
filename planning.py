@@ -20,6 +20,7 @@ from kb import (
     SOUTH,
     WEST,
     DIRECTION_VECTORS,
+    UNKNOWN,
     FREE,
     OCC,
 )
@@ -431,6 +432,8 @@ def plan_box_delivery(
     *,
     turn_cost: float = 0.5,
     max_states: int = 50000,
+    allow_unknown_robot: bool = False,
+    allow_unknown_box_dest: bool = False,
 ) -> Optional[list[str]]:
     """
     Plan complete action sequence to deliver box to goal using A* over combined state.
@@ -481,7 +484,7 @@ def plan_box_delivery(
         if (x, y) == box_pos:
             return False  # Can't walk through the box (unless pushing)
         state = static_cell_state(x, y)
-        return state == FREE  # keep UNKNOWN non-traversable for safety
+        return state == FREE or (allow_unknown_robot and state == UNKNOWN)
 
     def is_cell_empty_for_box(x: int, y: int) -> bool:
         """Check if cell is valid for box to move into (not wall, not goal-blocking)."""
@@ -545,9 +548,13 @@ def plan_box_delivery(
             # Box would move to cell beyond it
             box_dest_x, box_dest_y = bx + dx, by + dy
 
-            # Check if box destination is valid (not wall, not out of bounds)
+            # Check if box destination is valid (not wall, not out of bounds).
+            # If `allow_unknown_box_dest` is enabled, we allow pushing into UNKNOWN
+            # (still disallowing OCC/walls), which is useful in partially mapped worlds.
             box_dest_state = static_cell_state(box_dest_x, box_dest_y)
-            if box_dest_state == FREE:
+            if (box_dest_state == FREE) or (
+                allow_unknown_box_dest and box_dest_state != OCC
+            ):
                 # Push is valid: robot moves to box position, box moves forward
                 new_state = (ahead_x, ahead_y, heading, box_dest_x, box_dest_y)
                 if new_state not in visited:
