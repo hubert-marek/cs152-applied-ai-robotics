@@ -5,11 +5,6 @@ This module handles:
 - Wheel velocity control
 - Movement primitives (move N cells, turn 90°)
 - Sensor reading (LiDAR, odometry, gyroscope)
-
-High-level KB updates (task/plan state) are handled by the mission controller.
-This module may update KB occupancy (via LiDAR integration) and keep the KB pose
-in sync with the robot's pose estimate during scans.
-Environment setup is in simulation.py.
 """
 
 import math
@@ -19,12 +14,18 @@ from collections import Counter
 import pybullet
 
 import kb as kb_store
+import simulation
 from mapping import integrate_lidar
 from simulation import TIME_STEP, CELL_SIZE
+from metrics import get_metrics
 
-# =============================================================================
+# LiDAR scan time in simulation steps
+# A typical scanning LiDAR (e.g., RPLiDAR A1) rotates at ~5-10Hz,
+# meaning a full 360° scan takes ~100-200ms. We use 50ms (12 steps
+# at 240Hz) as a conservative estimate for a fast LiDAR.
+LIDAR_SCAN_STEPS = 12  # ~50ms at 240Hz
+
 # CONSTANTS
-# =============================================================================
 
 # Robot joint indices (match `PybulletRobotics/urdf/simple_two_wheel_car.urdf`)
 # Driven wheels:
@@ -46,6 +47,7 @@ LIDAR_RANGE = 2.0
 LIDAR_NUM_RAYS = 72
 
 
+# Helper
 def normalize_angle(angle: float) -> float:
     """Normalize angle to [-pi, pi]."""
     while angle > math.pi:
@@ -55,9 +57,7 @@ def normalize_angle(angle: float) -> float:
     return angle
 
 
-# =============================================================================
 # LIDAR SENSOR
-# =============================================================================
 
 
 class Lidar:
@@ -98,7 +98,6 @@ class Lidar:
             ]
             ray_from.append(start)
 
-            # IMPORTANT: end at max_range from the sensor origin (not offset+range)
             end = [
                 position[0] + self.max_range * math.cos(world_angle),
                 position[1] + self.max_range * math.sin(world_angle),
@@ -178,28 +177,24 @@ class Lidar:
 
 
 # =============================================================================
-# ROBOT CONTROLLER
-# =============================================================================
 
 
 class RobotController:
     """
     Low-level robot control with proportional control.
-
-    Does NOT update KB - that's the mission controller's job.
     """
 
     # Control parameters
     DISTANCE_TOLERANCE = CELL_SIZE * 0.01
-    ANGLE_TOLERANCE = math.radians(1.5)  # Tighter for compact robot
-    MAX_MOVE_SPEED = 10  # Reduced for 4-wheel stability
+    ANGLE_TOLERANCE = math.radians(1.5)
+    MAX_MOVE_SPEED = 10
     MIN_MOVE_SPEED = 2
-    MAX_TURN_SPEED = 5  # Slightly increased for compact robot
-    MIN_TURN_SPEED = 1.5  # Higher minimum for better control
+    MAX_TURN_SPEED = 5
+    MIN_TURN_SPEED = 1.5
     HEADING_KP = 6.0
     MAX_HEADING_CORRECTION = 4.0
-    TURN_SNAP_KP = 6.0  # Increased gain for faster convergence
-    TURN_SNAP_MAX_STEPS = 800  # More steps for precise turns
+    TURN_SNAP_KP = 6.0  #
+    TURN_SNAP_MAX_STEPS = 800
 
     # Pose estimation parameters
     SLIP_THRESHOLD = 0.02  # 2cm difference triggers slip detection
@@ -226,7 +221,8 @@ class RobotController:
         self.pose_y = CELL_SIZE / 2
         self.pose_yaw = 0.0
 
-        # Discovered wall positions (landmarks for recalibration)
+        # Discovered wall positions (landmarks for recalibration) #TODO here we need to update the code to actually use algorithm for calssyfing walls. I thin kit should be easy, bascially make a datastrcutre that stores data from the entry
+        #  (remember that north, south etc is all relevative - north is where robot starts), and then if a new wall is detected (the object size is bigger than box, i.e. bigger than 60 cm widfgt based on visible rays), check the angle of this, and verify against the internal measurments assgign ID to this wall and mark it as east, north or west etc.
         self._wall_landmarks = {}
         # Map PyBullet wall body id -> semantic wall type ("east"/"west"/"north"/"south").
         # This prevents the recalibration math from ever "matching" a north-wall hit to
@@ -235,7 +231,7 @@ class RobotController:
 
         self.lidar = Lidar(robot_id)
         self._ccw_command_increases_yaw = None
-        # Optional "magnet gripper" (implemented as a temporary fixed constraint).
+        # Optional "magnet gripper" (implemented as a temporary fixed constraint). #TODO, remove all code related to magnet gripper - it is no longer needed
         # Disabled unless explicitly used by the mission/controller.
         self._grip_constraint_id: int | None = None
 
@@ -376,6 +372,9 @@ class RobotController:
         Returns:
             scan_data: List of (angle, distance, obj_id) tuples
         """
+        # Account for realistic LiDAR scan time (~50ms)
+        simulation.step(LIDAR_SCAN_STEPS)
+
         scan_data = self.lidar.scan(visualize=visualize)
 
         # Debug: show scan stats
@@ -387,6 +386,7 @@ class RobotController:
         # sync the KB robot pose so planning/mapping share the same frame.
         if recalibrate and self._wall_landmarks:
             self._recalibrate_from_lidar(scan_data)
+            get_metrics().record_recalibration()
 
         # Use the (possibly recalibrated) internal pose estimate to locate rays.
         # This prevents occupancy updates from being "painted" relative to a stale
@@ -479,7 +479,7 @@ class RobotController:
 
     def _wait_and_step(self, steps, realtime=False):
         for _ in range(steps):
-            pybullet.stepSimulation()
+            simulation.step(1)
             if realtime:
                 time.sleep(TIME_STEP)
 
@@ -513,7 +513,7 @@ class RobotController:
         Uses velocity-based distance tracking (more reliable than wheel odometry
         which can have encoder issues) and gyroscope for heading.
 
-        NOTE: LiDAR recalibration is DISABLED - it was causing drift by recording
+        NOTE: LiDAR recalibration is DISABLED - it was causing drift by recording #TODO isn't this comment outdated as we are now colling recallibrate from LIdAR and veryfing based on knwoeldge about right angle of walls?
         landmarks from already-drifted positions. We rely on pose snapping after
         each waypoint to prevent drift accumulation.
 
@@ -704,56 +704,114 @@ class RobotController:
 
             wall_pos = float(self._wall_landmarks[key])
 
-            # Residual in wall-coordinate space (equivalent to distance_error * cos/sin)
+            # =========================================================
+            # RESIDUAL COMPUTATION for position correction
+            # =========================================================
+            # For an east/west wall at x = wall_pos:
+            #   - Ray hits at: implied_x = pose_x + d * cos(angle)
+            #   - Residual = implied_x - wall_pos
+            #   - Positive residual → we think we're too far east
+            #
+            # For a north/south wall at y = wall_pos:
+            #   - Ray hits at: implied_y = pose_y + d * sin(angle)
+            #   - Residual = implied_y - wall_pos
+            #   - Positive residual → we think we're too far north
+            #
+            # We require the ray to have significant component toward the wall
+            # (|cos| > 0.2 for X walls, |sin| > 0.2 for Y walls) to avoid
+            # grazing rays which are noisy and unreliable.
+            # =========================================================
             if wall_type in ("east", "west"):
-                if abs(ca) < 0.2:
+                if abs(ca) < 0.2:  # Ray nearly parallel to wall - skip
                     continue
-                residual = (self.pose_x + d_measured * ca) - wall_pos
-                if abs(residual) > CELL_SIZE * 1.0:
+                implied_x = self.pose_x + d_measured * ca
+                residual = implied_x - wall_pos
+                if abs(residual) > CELL_SIZE * 1.0:  # Outlier - skip
                     continue
                 x_errors.append(residual)
                 d_expected = (wall_pos - self.pose_x) / ca
             else:
-                if abs(sa) < 0.2:
+                if abs(sa) < 0.2:  # Ray nearly parallel to wall - skip
                     continue
-                residual = (self.pose_y + d_measured * sa) - wall_pos
-                if abs(residual) > CELL_SIZE * 1.0:
+                implied_y = self.pose_y + d_measured * sa
+                residual = implied_y - wall_pos
+                if abs(residual) > CELL_SIZE * 1.0:  # Outlier - skip
                     continue
                 y_errors.append(residual)
                 d_expected = (wall_pos - self.pose_y) / sa
 
             wall_ray_samples.append((wall_type, d_measured, float(d_expected)))
 
-        # Apply position corrections
+        # =====================================================================
+        # POSITION CORRECTION using wall distance measurements
+        # =====================================================================
+        # We have collected residuals: (implied_pos - known_wall_pos) for each ray.
+        # A positive residual means we think we're further from origin than we are.
+        # Correct by subtracting the median residual (robust to outliers).
+        #
+        # Why median? Some rays might hit corners, box edges, or have noise.
+        # Median ignores up to 50% outliers, mean would be corrupted.
+        # =====================================================================
         corrections_made = []
         yaw_corrected = False
 
         if x_errors:
-            # Use median to be robust against outliers
+            # Median: robust against outliers (corners, noise, misclassification)
             x_errors_sorted = sorted(x_errors)
-            avg_x_error = x_errors_sorted[len(x_errors_sorted) // 2]
-            if abs(avg_x_error) > 0.01:  # Only correct significant errors
+            median_x_error = x_errors_sorted[len(x_errors_sorted) // 2]
+            if abs(median_x_error) > 0.01:  # Only correct errors > 1cm
                 old_x = self.pose_x
-                self.pose_x -= avg_x_error * 0.8  # 80% correction
+                # Apply 80% of correction (damped to prevent oscillation)
+                self.pose_x -= median_x_error * 0.8
                 corrections_made.append(
-                    f"X: {old_x:.3f}→{self.pose_x:.3f} (err={avg_x_error:+.3f}m, n={len(x_errors)})"
+                    f"X: {old_x:.3f}→{self.pose_x:.3f} (err={median_x_error:+.3f}m, n={len(x_errors)})"
                 )
 
         if y_errors:
             y_errors_sorted = sorted(y_errors)
-            avg_y_error = y_errors_sorted[len(y_errors_sorted) // 2]
-            if abs(avg_y_error) > 0.01:
+            median_y_error = y_errors_sorted[len(y_errors_sorted) // 2]
+            if abs(median_y_error) > 0.01:  # Only correct errors > 1cm
                 old_y = self.pose_y
-                self.pose_y -= avg_y_error * 0.8
+                self.pose_y -= median_y_error * 0.8
                 corrections_made.append(
-                    f"Y: {old_y:.3f}→{self.pose_y:.3f} (err={avg_y_error:+.3f}m, n={len(y_errors)})"
+                    f"Y: {old_y:.3f}→{self.pose_y:.3f} (err={median_y_error:+.3f}m, n={len(y_errors)})"
                 )
 
-        # Apply heading correction
+        # =====================================================================
+        # YAW CORRECTION using axis-aligned wall constraint
+        # =====================================================================
+        #
+        # KEY INSIGHT: In an axis-aligned environment, we don't need two
+        # perpendicular walls for yaw correction. A SINGLE wall is sufficient!
+        #
+        # Why? Consider rays hitting an east wall at x = W:
+        #   - Ray at relative angle α with distance d hits at:
+        #     hit_x = pose_x + d * cos(yaw + α)
+        #   - For the ray to hit the wall: hit_x should equal W
+        #
+        # If our yaw estimate is WRONG:
+        #   - Different rays will compute different "implied" wall positions
+        #   - The VARIANCE of implied positions reveals yaw error
+        #   - The CORRECT yaw makes all rays agree on wall position
+        #
+        # We search yaw values in a small window and pick the one that
+        # minimizes the variance (squared residuals) of implied wall positions.
+        #
+        # This works because we're correcting DRIFT, not estimating yaw
+        # from scratch. We have a prior that's within ~10-15° of truth.
+        # =====================================================================
+
         def _yaw_cost(theta: float) -> float | None:
+            """
+            Compute cost (mean squared residual) for candidate yaw θ.
+
+            Lower cost = rays hitting walls imply more consistent wall positions.
+            Returns None if insufficient data for reliable estimate.
+            """
             residual2: list[float] = []
-            axis_counts = {"x": 0, "y": 0}
+
             for ray_angle, d_measured, obj_id in scan_data:
+                # Filter: only wall hits with valid measurements
                 if obj_id not in self.wall_ids:
                     continue
                 if obj_id == -1:
@@ -769,38 +827,49 @@ class RobotController:
                     continue
                 wall_pos = float(self._wall_landmarks[key])
 
+                # Compute absolute angle of this ray in world frame
                 a = normalize_angle(theta + ray_angle)
                 ca = math.cos(a)
                 sa = math.sin(a)
+
+                # Compute residual: difference between implied and known wall position
                 if wall_type in ("east", "west"):
+                    # X-axis walls: ray must have significant X component
                     if abs(ca) < 0.2:
                         continue
-                    r = (self.pose_x + d_measured * ca) - wall_pos
-                    axis_counts["x"] += 1
+                    # Implied wall position from this ray
+                    implied_wall_x = self.pose_x + d_measured * ca
+                    r = implied_wall_x - wall_pos
                 else:
+                    # Y-axis walls: ray must have significant Y component
                     if abs(sa) < 0.2:
                         continue
-                    r = (self.pose_y + d_measured * sa) - wall_pos
-                    axis_counts["y"] += 1
+                    implied_wall_y = self.pose_y + d_measured * sa
+                    r = implied_wall_y - wall_pos
 
+                # Reject outliers (likely misclassified or noise)
                 if abs(r) > CELL_SIZE * 1.0:
                     continue
                 residual2.append(r * r)
 
-            # Yaw is underconstrained unless we see BOTH an X-wall and a Y-wall.
-            if len(residual2) < 12 or axis_counts["x"] < 3 or axis_counts["y"] < 3:
+            # Need sufficient samples for reliable correction
+            # NOTE: Single wall is enough! We don't require both X and Y walls
+            # because variance of implied positions detects yaw error either way
+            if len(residual2) < 8:
                 return None
+
+            # Robust statistic: trimmed mean (ignore worst 30% as outliers)
             residual2.sort()
-            keep = max(5, int(len(residual2) * 0.7))  # trim worst 30%
+            keep = max(5, int(len(residual2) * 0.7))
             return sum(residual2[:keep]) / keep
 
+        # Evaluate cost at current yaw estimate
         current_cost = _yaw_cost(self.pose_yaw)
         best_theta = self.pose_yaw
         best_cost = current_cost if current_cost is not None else float("inf")
 
-        # Search a window around current yaw.
-        # With the axis constraint above, yaw only updates near corners (seeing 2 walls),
-        # so we keep the search window tighter to avoid catastrophic flips.
+        # Search a ±25° window around current yaw in 0.5° steps
+        # This is drift correction, not full estimation - we expect small errors
         window = math.radians(25.0)
         step = math.radians(0.5)
         theta = self.pose_yaw - window
@@ -812,13 +881,20 @@ class RobotController:
                 best_theta = theta
             theta += step
 
+        # Apply correction only if:
+        # 1. We have a valid current cost (enough wall data)
+        # 2. New yaw is significantly better (15% improvement threshold)
+        # 3. Correction is in reasonable range (2°-15°) - not noise, not catastrophic
         if current_cost is not None:
-            # Require meaningful improvement to avoid noisy oscillations
-            if best_cost < current_cost * 0.85:
+            if best_cost < current_cost * 0.85:  # 15% improvement required
                 yaw_err = normalize_angle(self.pose_yaw - best_theta)
-                # Hard bound: never apply huge yaw corrections in one shot.
+
+                # Safety bounds:
+                # - Below 2°: likely just noise, don't correct
+                # - Above 15°: too large, might be a misdetection
                 if math.radians(2.0) < abs(yaw_err) < math.radians(15.0):
                     old_yaw = self.pose_yaw
+                    # Apply 70% of correction (damped to prevent oscillation)
                     self.pose_yaw = normalize_angle(self.pose_yaw - yaw_err * 0.7)
                     yaw_corrected = True
                     corrections_made.append(
@@ -826,7 +902,13 @@ class RobotController:
                         f"(err={math.degrees(yaw_err):+.1f}°, n={len(scan_data)})"
                     )
 
-        # If yaw changed, do one more lightweight XY correction with the new yaw.
+        # =====================================================================
+        # POST-YAW POSITION REFINEMENT
+        # =====================================================================
+        # After correcting yaw, our position estimates (computed with the OLD
+        # yaw) are slightly off. Recalculate X/Y corrections using the NEW yaw.
+        # This is a lightweight second pass - we already have wall associations.
+        # =====================================================================
         if yaw_corrected:
             x2: list[float] = []
             y2: list[float] = []
@@ -913,7 +995,9 @@ class RobotController:
             Number of new landmarks recorded.
         """
         if scan_data is None:
-            scan_data = self.lidar.scan(visualize=False)
+            # Account for LiDAR scan time (~50ms)
+            simulation.step(LIDAR_SCAN_STEPS)
+            scan_data = self.lidar.scan(visualize=True)
 
         if not scan_data:
             return 0
@@ -1100,7 +1184,7 @@ class RobotController:
 
     # --- High-level movement primitives ---
 
-    def move_to_waypoint(
+    def move_to_waypoint(  # TODO Here I think again more explinations, and I am aslo thinkiing if this shouldnt be refractortd to mission planner, and in robot we just keep the controller? But I am open to leaving this but want to hear your opinion
         self,
         target_grid_x: int,
         target_grid_y: int,
@@ -1206,7 +1290,9 @@ class RobotController:
         )
 
         if self._wall_landmarks:
-            scan_data = self.lidar.scan(visualize=False)
+            # Account for LiDAR scan time (~50ms)
+            simulation.step(LIDAR_SCAN_STEPS)
+            scan_data = self.lidar.scan(visualize=True)
             self._recalibrate_from_lidar(scan_data)
 
         # DEBUG: Show arrival accuracy - compare internal vs actual
@@ -1286,7 +1372,9 @@ class RobotController:
 
         self._stop()
 
-    def move(self, direction: str, realtime=False, snap_yaw=True):
+    def move(
+        self, direction: str, realtime=False, snap_yaw=True
+    ):  # TODO if this is legacy why do we keep it?
         """
         Move one cell in given direction (legacy discrete method).
 
@@ -1332,7 +1420,9 @@ class RobotController:
         if snap_yaw:
             self._snap_to_kb_yaw(realtime)
 
-    def turn(self, direction: str, realtime=False):
+    def turn(
+        self, direction: str, realtime=False
+    ):  # TODO DO we actually need it if we have turn to angle
         """Turn 90° in given direction ('left' or 'right')."""
         # Relative 90° turn using gyro-integrated yaw estimate (no KB dependency).
         delta = math.pi / 2 if direction == "left" else -math.pi / 2

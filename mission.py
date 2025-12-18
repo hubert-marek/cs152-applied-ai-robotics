@@ -18,8 +18,10 @@ from typing import TYPE_CHECKING
 import pybullet
 
 import planning
+import simulation
 from simulation import CELL_SIZE, TIME_STEP
 from robot import DIRECTION_VECTORS, ORIENTATION_NAMES
+from metrics import get_metrics
 
 if TYPE_CHECKING:
     from robot import RobotController
@@ -30,7 +32,7 @@ if TYPE_CHECKING:
 # centers after each waypoint/action. This can mask estimator drift, but if the
 # robot does not physically reach the planned cell it will de-sync pose from
 # LiDAR observations and break box re-detection/push verification.
-SNAP_INTERNAL_POSE = False
+SNAP_INTERNAL_POSE = False  # TODO I think now we can safley remove all snapping functionality? As I understanding it is bascially faking internal readings?
 
 
 class MissionController:
@@ -79,6 +81,8 @@ class MissionController:
         if not actions:
             return True
 
+        # TODO I am thinking now if the planners shouldnt just retruns a list of coordinates to go to so we dont have to move from path to actions and back from actions to path so it would make code simpler
+
         # Convert actions to waypoints (simulate to find where we end up)
         waypoints = self._actions_to_waypoints(actions)
         print(f"  Executing {len(actions)} actions → {len(waypoints)} waypoints")
@@ -90,6 +94,7 @@ class MissionController:
             reached = self.robot.move_to_waypoint(
                 wx, wy, target_heading=heading, realtime=realtime
             )
+            get_metrics().record_waypoint_result(reached)
             if not reached:
                 print("    ERROR: Failed to reach waypoint (timeout)")
                 return False
@@ -97,14 +102,14 @@ class MissionController:
             # Update KB to match
             self._sync_kb_to_position(wx, wy, heading)
 
-            # Scan and recalibrate pose using wall landmarks at waypoint
+            # Scan and recalibrate pose using wall landmarks at waypoint #TODO isnt this duplicatiing actions in move to waypoint? Which actually should be more primitive and all calibration functions should be called here in mission planner?
             _ = self.robot.scan_lidar(visualize=realtime, recalibrate=True)
 
         return True
 
     def _actions_to_waypoints(self, actions: list[str]) -> list[tuple[int, int, int]]:
         """
-        Convert action sequence to waypoints with headings.
+        Convert action sequence to waypoints with headings. #TODO yaeh like this seems stupid - we should probably conssolidate the units used between planer and mission planner
 
         Returns list of (grid_x, grid_y, heading) tuples.
         Only includes waypoints where position changes or heading
@@ -168,7 +173,7 @@ class MissionController:
         # Sync KB to TARGET waypoint (not drifted pose!)
         self.kb.set_robot(x, y, heading)
 
-        # Optionally snap internal pose to grid cell center.
+        # Optionally snap internal pose to grid cell center. #TODO this to remove?
         if SNAP_INTERNAL_POSE:
             self.robot.snap_pose_to_grid(x, y, heading)
 
@@ -225,18 +230,25 @@ class MissionController:
         self, realtime: bool = True, max_steps: int = 100
     ) -> bool:
         """
-        Explore the environment using frontier-based exploration until box is found.
+        Explore the environment using frontier-based exploration until box is found
+        AND a delivery path exists.
+
+        The robot must not only find the box, but also explore enough of the
+        environment that the Sokoban planner can find a valid delivery path
+        (pushing into UNKNOWN cells is forbidden for safety).
 
         Args:
             realtime: If True, add visualization delays
             max_steps: Maximum exploration steps before giving up
 
         Returns:
-            True if box was found, False if exploration exhausted
+            True if box was found and delivery path exists, False otherwise
         """
         print("\n" + "=" * 50)
         print("MISSION: Explore to find the box")
         print("=" * 50)
+
+        box_found = False
 
         for step in range(max_steps):
             # Debug: show real vs KB state
@@ -246,9 +258,25 @@ class MissionController:
             scan_data = self.robot.scan_lidar(visualize=realtime, recalibrate=True)
 
             if self._check_for_box(scan_data):
-                print(f"\n  >>> BOX FOUND at step {step}! <<<")
+                if not box_found:
+                    print(f"\n  >>> BOX FOUND at step {step}! <<<")
+                    box_found = True
                 self.kb.print_grid()
-                return True
+
+                # OPTIMISTIC PLANNING: Try to plan delivery immediately
+                # The Sokoban planner now allows pushing into UNKNOWN cells,
+                # and single-wall yaw correction keeps us localized even in
+                # partially explored areas. Replanning handles surprises.
+                delivery_plan = planning.plan_box_delivery(self.kb)
+                if delivery_plan is not None:
+                    print(
+                        f"  >>> Delivery path exists ({len(delivery_plan)} actions) <<<"
+                    )
+                    return True
+                else:
+                    print(
+                        "  [INFO] Box found but no delivery path yet - continuing exploration..."
+                    )
 
             # Debug: KB stats
             free_cells = sum(1 for s in self.kb.occ.values() if s == 0)  # FREE=0
@@ -271,8 +299,11 @@ class MissionController:
                 scan_data = self.robot.scan_lidar(visualize=realtime, recalibrate=True)
                 if self._check_for_box(scan_data):
                     print("\n  >>> BOX FOUND during final scan! <<<")
-                    return True
-                return False
+                    # Final check for delivery path
+                    if planning.plan_box_delivery(self.kb) is not None:
+                        return True
+                    print("  [ERROR] Box found but no valid delivery path exists!")
+                return box_found  # Return True if box found even without path
 
             print(f"\n  Exploration step {step + 1}: {len(actions)} actions")
             if not self.execute_actions(actions, realtime):
@@ -281,24 +312,25 @@ class MissionController:
             self.kb.print_grid()
 
         print(f"\n  Exploration limit reached ({max_steps} steps)")
-        return False
+        return box_found
 
     def _check_for_box(self, scan_data) -> bool:
         """
         Check if the box is visible in the current scan.
 
         Uses the robot's INTERNAL pose estimate (which should be recalibrated
-        before calling this) to calculate box position. This keeps everything
-        in the internal coordinate frame without relying on PyBullet ground truth.
+        before calling this) to calculate box position.
         """
-        # Debug: show what object IDs we're seeing
+        # Debug: show what object IDs we're seeing #Yeah like
         detected_ids = set(obj_id for _, _, obj_id in scan_data if obj_id != -1)
         print(
             f"  [DEBUG] LiDAR detected object IDs: {detected_ids}, looking for box_id={self.box_id}"
         )
 
         for angle, distance, obj_id in scan_data:
-            if obj_id == self.box_id:
+            if (
+                obj_id == self.box_id
+            ):  # #TODO, Yeah like rather than cheating with pybullet ids, we should create a helper inside mapping called classify object that will determine what type of object is that
                 # Use INTERNAL pose (recalibrated) - not PyBullet ground truth
                 # This keeps the entire system in the internal coordinate frame
                 pose = self.robot.get_pose()
@@ -434,6 +466,7 @@ class MissionController:
             Replan delivery from the robot's current *estimated* pose and latest
             LiDAR-based box observation (no ground-truth).
             """
+            get_metrics().record_replanning(reason)
             print(f"      [REPLAN] Triggered: {reason}")
             print("        [REPLAN-STATE] Before refresh:")
             print(
@@ -450,14 +483,14 @@ class MissionController:
 
             # Refresh box estimate with recalibration (best effort)
             print("        [REPLAN] Scanning for box position...")
-            scan_data = self.robot.scan_lidar(visualize=False, recalibrate=True)
+            scan_data = self.robot.scan_lidar(visualize=True, recalibrate=True)
             box_found = self._update_box_from_lidar(scan_data)
 
             if not box_found:
                 print("        [REPLAN] Box not visible - backing up...")
                 # Back up and scan again (may be occluded by the robot/box contact)
                 self.robot.move("backward", realtime)
-                scan_data = self.robot.scan_lidar(visualize=False, recalibrate=True)
+                scan_data = self.robot.scan_lidar(visualize=True, recalibrate=True)
                 self._update_box_from_lidar(scan_data)
 
             # Sync robot pose from sensors
@@ -588,6 +621,8 @@ class MissionController:
                         heading_for_kb=current_heading,
                     )
                 print("        [SUCCESS] Turn completed")
+                # Recalibrate after turn to sync yaw estimate
+                self.robot.scan_lidar(visualize=True, recalibrate=True)
                 self.kb.set_robot(robot_x, robot_y, new_heading)
                 if SNAP_INTERNAL_POSE:
                     self.robot.snap_pose_to_grid(robot_x, robot_y, new_heading)
@@ -624,6 +659,8 @@ class MissionController:
                         heading_for_kb=current_heading,
                     )
                 print("        [SUCCESS] Turn completed")
+                # Recalibrate after turn to sync yaw estimate
+                self.robot.scan_lidar(visualize=True, recalibrate=True)
                 self.kb.set_robot(robot_x, robot_y, new_heading)
                 if SNAP_INTERNAL_POSE:
                     self.robot.snap_pose_to_grid(robot_x, robot_y, new_heading)
@@ -655,7 +692,7 @@ class MissionController:
                             f"        [VERIFY] Scanning to confirm box moved to ({new_box_x},{new_box_y})..."
                         )
                         scan_data = self.robot.scan_lidar(
-                            visualize=False, recalibrate=True
+                            visualize=True, recalibrate=True
                         )
                         box_found = self._update_box_from_lidar(scan_data)
 
@@ -666,7 +703,7 @@ class MissionController:
                             # Back up and scan again (robot may occlude the box)
                             self.robot.move("backward", realtime)
                             scan_data = self.robot.scan_lidar(
-                                visualize=False, recalibrate=True
+                                visualize=True, recalibrate=True
                             )
                             box_found = self._update_box_from_lidar(scan_data)
 
@@ -734,6 +771,18 @@ class MissionController:
                         print("        [FAILED] Move did not complete successfully")
                         return _replan_delivery(
                             reason=f"move_forward failed to reach ({target_x},{target_y})",
+                            heading_for_kb=current_heading,
+                        )
+
+                    # Verify we actually reached the right cell
+                    pose = self.robot.get_pose()
+                    if (pose["grid_x"], pose["grid_y"]) != (target_x, target_y):
+                        print(
+                            f"        [DRIFT] Ended at ({pose['grid_x']},{pose['grid_y']}) "
+                            f"instead of ({target_x},{target_y}) - replanning!"
+                        )
+                        return _replan_delivery(
+                            reason=f"position drift: expected ({target_x},{target_y}), got ({pose['grid_x']},{pose['grid_y']})",
                             heading_for_kb=current_heading,
                         )
                     print("        [SUCCESS] Move completed")
@@ -913,7 +962,7 @@ class MissionController:
             correction = max(-3.0, min(3.0, 4.0 * yaw_error))
             self.robot._set_drive_wheels(push_speed, correction, realtime)
 
-            pybullet.stepSimulation()
+            simulation.step(1)
             if realtime:
                 time.sleep(TIME_STEP)
 
@@ -992,14 +1041,13 @@ class MissionController:
                 correction = max(-3.0, min(3.0, 4.0 * yaw_error))
                 self.robot._set_drive_wheels(push_speed, correction, realtime)
 
-                pybullet.stepSimulation()
+                simulation.step(1)
                 if realtime:
                     time.sleep(TIME_STEP)
 
             self.robot._stop()
             # Let physics settle
-            for _ in range(30):
-                pybullet.stepSimulation()
+            simulation.step(30)
         finally:
             pass  # No cleanup needed
 
@@ -1016,8 +1064,18 @@ class MissionController:
             f"yaw={math.degrees(box_euler[2]):.1f}°, grid=({box_grid_x},{box_grid_y})"
         )
 
+        # Record push attempt metrics
+        push_success = robot_pushed_distance >= push_distance * 0.5
+        get_metrics().record_push_attempt(
+            success=push_success,
+            expected_pos=(expected_box_x, expected_box_y),
+            actual_pos=(box_grid_x, box_grid_y),
+            distance_pushed=robot_pushed_distance,
+            contact_maintained=(contact_lost_count <= 50),
+        )
+
         # We assume success if we maintained contact for reasonable distance
-        return robot_pushed_distance >= push_distance * 0.5
+        return push_success
 
     def run_full_mission(self, realtime: bool = True) -> bool:
         """
@@ -1026,21 +1084,40 @@ class MissionController:
         Returns:
             True if mission completed successfully
         """
+        metrics = get_metrics()
+        # Note: test case configuration is set in main.py where actual positions are known
+        metrics.start_mission()
+
         print("\n" + "#" * 60)
         print("# STARTING FULL MISSION: Find and deliver box to goal")
         print("#" * 60)
 
         # Phase 1: Explore to find box
-        if not self.explore_until_box_found(realtime):
+        metrics.start_phase("exploration")
+        exploration_success = self.explore_until_box_found(realtime)
+        metrics.end_phase("exploration")
+
+        if not exploration_success:
             print("\nMISSION FAILED: Could not find box")
+            metrics.end_mission(success=False)
+            metrics.print_summary()
             return False
 
         # Phase 2: Deliver box to goal
-        if not self.deliver_box_to_goal(realtime):
+        metrics.start_phase("delivery")
+        delivery_success = self.deliver_box_to_goal(realtime)
+        metrics.end_phase("delivery")
+
+        if not delivery_success:
             print("\nMISSION FAILED: Could not deliver box")
+            metrics.end_mission(success=False)
+            metrics.print_summary()
             return False
 
         print("\n" + "#" * 60)
         print("# MISSION COMPLETE!")
         print("#" * 60)
+
+        metrics.end_mission(success=True)
+        metrics.print_summary()
         return True

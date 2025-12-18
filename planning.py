@@ -10,8 +10,11 @@ Contains:
 
 from __future__ import annotations
 
+import time
 from heapq import heappush, heappop
 from typing import Optional
+
+from metrics import get_metrics
 
 from kb import (
     KnowledgeBase,
@@ -70,6 +73,7 @@ def astar(
     start_heading: Optional[int] = None,
     allow_unknown: bool = False,
     turn_cost: float = 0.0,
+    search_type: str = "navigation",
 ) -> Optional[list[tuple[int, int]]]:
     """
     A* search on 4-connected grid with optional turn penalty.
@@ -81,11 +85,26 @@ def astar(
         start_heading: initial heading (NORTH/EAST/SOUTH/WEST), uses kb.robot_heading if None
         allow_unknown: if True, treat UNKNOWN cells as traversable (optimistic)
         turn_cost: penalty per 90° turn (0 = no penalty, 0.5 = half a cell cost per turn)
+        search_type: label for metrics ("navigation", "exploration", "sokoban")
 
     Returns:
         List of (x, y) cells from start to goal (inclusive), or None if no path.
     """
+    search_start_time = time.perf_counter()
+    nodes_expanded = 0
+
     if start == goal:
+        # Record trivial search
+        search_time_ms = (time.perf_counter() - search_start_time) * 1000
+        get_metrics().record_astar_search(
+            nodes_expanded=0,
+            path_length=1,
+            found_path=True,
+            search_time_ms=search_time_ms,
+            start=start,
+            goal=goal,
+            search_type=search_type,
+        )
         return [start]
 
     # Get starting heading
@@ -105,6 +124,17 @@ def astar(
             print(
                 f"    [DEBUG] A* goal {goal} not traversable: state={state_name}, box={kb.box}"
             )
+            # Record failed search
+            search_time_ms = (time.perf_counter() - search_start_time) * 1000
+            get_metrics().record_astar_search(
+                nodes_expanded=0,
+                path_length=0,
+                found_path=False,
+                search_time_ms=search_time_ms,
+                start=start,
+                goal=goal,
+                search_type=search_type,
+            )
             return None
 
     # State: (x, y, heading) to account for turn costs
@@ -123,11 +153,23 @@ def astar(
         x, y, heading = state
 
         if (x, y) == goal:
+            # Record successful search
+            search_time_ms = (time.perf_counter() - search_start_time) * 1000
+            get_metrics().record_astar_search(
+                nodes_expanded=nodes_expanded,
+                path_length=len(path),
+                found_path=True,
+                search_time_ms=search_time_ms,
+                start=start,
+                goal=goal,
+                search_type=search_type,
+            )
             return path
 
         if state in visited:
             continue
         visited.add(state)
+        nodes_expanded += 1
 
         # Explore 4-connected neighbors
         for neighbor in kb.neighbors4(x, y):
@@ -158,6 +200,17 @@ def astar(
             new_path = path + [neighbor]
             heappush(open_set, (new_f, new_g, neighbor_state, new_path))
 
+    # Record failed search
+    search_time_ms = (time.perf_counter() - search_start_time) * 1000
+    get_metrics().record_astar_search(
+        nodes_expanded=nodes_expanded,
+        path_length=0,
+        found_path=False,
+        search_time_ms=search_time_ms,
+        start=start,
+        goal=goal,
+        search_type=search_type,
+    )
     return None  # No path found
 
 
@@ -282,7 +335,9 @@ def plan_exploration_step(
 
         for approach in approaches:
             attempted += 1
-            path = astar(kb, robot_pos, approach, turn_cost=turn_cost)
+            path = astar(
+                kb, robot_pos, approach, turn_cost=turn_cost, search_type="exploration"
+            )
             if path is None:
                 print(
                     f"  [DEBUG] No path to approach {approach} for frontier {frontier}"
@@ -454,14 +509,27 @@ def plan_box_delivery(
     Returns:
         List of actions ['turn_left', 'turn_right', 'move_forward'], or None if no solution.
     """
+    search_start_time = time.perf_counter()
+
     if kb.robot is None or kb.box is None or kb.goal is None:
         return None
 
     goal_pos = kb.goal
     start_box = kb.box
+    start_pos = (kb.robot_x, kb.robot_y)
 
     # If already at goal, nothing to do
     if start_box == goal_pos:
+        search_time_ms = (time.perf_counter() - search_start_time) * 1000
+        get_metrics().record_astar_search(
+            nodes_expanded=0,
+            path_length=0,
+            found_path=True,
+            search_time_ms=search_time_ms,
+            start=start_pos,
+            goal=goal_pos,
+            search_type="sokoban",
+        )
         return []
 
     # State: (robot_x, robot_y, robot_heading, box_x, box_y)
@@ -518,6 +586,17 @@ def plan_box_delivery(
 
         # Goal check: box at goal
         if (bx, by) == goal_pos:
+            # Record successful search
+            search_time_ms = (time.perf_counter() - search_start_time) * 1000
+            get_metrics().record_astar_search(
+                nodes_expanded=states_explored,
+                path_length=len(actions),
+                found_path=True,
+                search_time_ms=search_time_ms,
+                start=start_pos,
+                goal=goal_pos,
+                search_type="sokoban",
+            )
             return actions
 
         if state in visited:
@@ -560,9 +639,12 @@ def plan_box_delivery(
             # Box would move to cell beyond it
             box_dest_x, box_dest_y = bx + dx, by + dy
 
-            # Check if box destination is valid (not wall, not out of bounds)
+            # Check if box destination is valid (must be FREE, not UNKNOWN)
+            # Optimistic: allow pushing into UNKNOWN cells (not just FREE)
+            # Trust replanning to handle unexpected obstacles discovered en route
+            # This reduces exploration time while single-wall yaw correction keeps us localized
             box_dest_state = static_cell_state(box_dest_x, box_dest_y)
-            if box_dest_state == FREE:
+            if box_dest_state != OCC:  # FREE or UNKNOWN both OK
                 # Push is valid: robot moves to box position, box moves forward
                 new_state = (ahead_x, ahead_y, heading, box_dest_x, box_dest_y)
                 if new_state not in visited:
@@ -573,4 +655,15 @@ def plan_box_delivery(
                         open_set, (new_f, new_g, new_state, actions + ["move_forward"])
                     )
 
+    # Record failed search
+    search_time_ms = (time.perf_counter() - search_start_time) * 1000
+    get_metrics().record_astar_search(
+        nodes_expanded=states_explored,
+        path_length=0,
+        found_path=False,
+        search_time_ms=search_time_ms,
+        start=start_pos,
+        goal=goal_pos,
+        search_type="sokoban",
+    )
     return None  # No solution found within state limit

@@ -10,20 +10,72 @@ Architecture:
 - planning.py   : Path planning (A*, exploration, box delivery)
 - robot.py      : Low-level robot control (wheels, sensors)
 - mission.py    : Mission execution (plan → actions → movements)
+- metrics.py    : Performance metrics collection
 - main.py       : Entry point (this file)
+
+Usage:
+    uv run python main.py              # Default test case
+    uv run python main.py --test A     # Run test case A (straight push)
+    uv run python main.py --test B     # Run test case B (one turn)
+    uv run python main.py --test C     # Run test case C (two turns)
 """
+
+import argparse
+import json
 
 import simulation
 import kb
 from robot import RobotController, EAST
 from mission import MissionController
+from metrics import reset_metrics, get_metrics
+
+# Test case configurations: (box_world_grid, goal_world_grid, description)
+# Robot always starts at PyBullet world grid (1, 1) → internal (0, 0), facing EAST
+# Room is 5m x 5m, grid cells are 0.5m, so valid grid range is 0-9
+TEST_CASES = {
+    "A": {
+        "name": "Straight Push",
+        # Robot at (1,1), box at (4,1), goal at (7,1) - all on same row, robot facing east
+        "box_pos": (2.25, 0.75),  # World meters - grid (4,1) → internal (3, 0)
+        "goal_grid": (7, 1),  # World grid → internal (6, 0) - straight east
+        "description": "Box directly east of robot; straight push, no turns needed",
+    },
+    "B": {
+        "name": "One Turn",
+        # Box is north, goal is further north - robot must turn once to push
+        "box_pos": (0.75, 2.25),  # World meters - grid (1,4) → internal (0, 3)
+        "goal_grid": (1, 7),  # World grid → internal (0, 6)
+        "description": "Box north of robot; requires one turn to face and push",
+    },
+    "C": {
+        "name": "Two Turns",
+        # Box diagonal, goal in different direction - needs repositioning
+        "box_pos": (2.25, 2.25),  # World meters - grid (4,4) → internal (3, 3)
+        "goal_grid": (1, 7),  # World grid → internal (0, 6) - push west then north
+        "description": "Box diagonal; multiple reorientations needed",
+    },
+    "default": {
+        "name": "Default",
+        "box_pos": (1.25, 4.25),  # Original default position
+        "goal_grid": (7, 7),
+        "description": "Standard test configuration",
+    },
+}
 
 
-def main():
+def main(test_case: str = "default"):
     """Run the box-pushing mission."""
+    # Reset metrics for fresh run
+    reset_metrics()
+
     print("=" * 60)
     print("Box Pushing Robot - CS152 Final Project")
     print("=" * 60)
+
+    # Get test case config
+    config = TEST_CASES.get(test_case, TEST_CASES["default"])
+    print(f"\nTest Case: {config['name']}")
+    print(f"Description: {config['description']}")
 
     # Connect to PyBullet
     print("\n[1] Connecting to PyBullet...")
@@ -40,9 +92,13 @@ def main():
             raise RuntimeError("PyBullet DIRECT connection failed")
         realtime = False
 
-    # Create environment
+    # Create environment with test case configuration
     print("\n[2] Creating environment...")
-    env = simulation.create_environment(room_size=5.0)
+    env = simulation.create_environment(
+        room_size=5.0,
+        box_pos=config["box_pos"],
+        goal_grid=config["goal_grid"],
+    )
     print(
         f"    Grid: {env['grid_size']}x{env['grid_size']} cells ({simulation.CELL_SIZE}m each)"
     )
@@ -114,6 +170,16 @@ def main():
         box_id=env["box_id"],
     )
 
+    # Record test case configuration in metrics (before mission starts)
+    # We do this here because we know the actual box position from env,
+    # whereas the KB doesn't know box position until exploration finds it
+    get_metrics().set_test_case(
+        name=config["name"],
+        robot_pos=(0, 0),  # Internal frame start
+        box_pos=box_internal,  # Actual box position in internal frame
+        goal_pos=goal_internal,  # Goal position in internal frame
+    )
+
     # Run the full mission
     print("\n[7] Starting mission...")
     success = mission.run_full_mission(realtime=realtime)
@@ -128,6 +194,17 @@ def main():
 
     knowledge.print_grid()
 
+    # Export metrics to JSON file
+    metrics_dict = get_metrics().to_dict()
+    metrics_file = f"metrics_{test_case}.json"
+    with open(metrics_file, "w") as f:
+        json.dump(metrics_dict, f, indent=2)
+    print(f"\nMetrics saved to {metrics_file}")
+
+    # Print LaTeX table for copy-paste
+    print("\n--- LaTeX Table (copy-paste ready) ---")
+    print(get_metrics().to_latex_table())
+
     # Keep window open for inspection (GUI mode only)
     if realtime:
         import pybullet
@@ -140,6 +217,20 @@ def main():
             pass
         pybullet.disconnect()
 
+    return success
+
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(
+        description="Box Pushing Robot - CS152 Final Project"
+    )
+    parser.add_argument(
+        "--test",
+        type=str,
+        default="default",
+        choices=["A", "B", "C", "default"],
+        help="Test case to run: A (straight), B (one turn), C (two turns), default",
+    )
+    args = parser.parse_args()
+
+    main(test_case=args.test)

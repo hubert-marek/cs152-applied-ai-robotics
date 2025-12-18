@@ -8,7 +8,7 @@ from typing import Iterator, Optional
 
 UNKNOWN, FREE, OCC = -1, 0, 1
 
-
+# Angles are assigned for debugging and readibiliy purpouse.
 NORTH, EAST, SOUTH, WEST = 0, 1, 2, 3
 ORIENTATION_NAMES = {NORTH: "N", EAST: "E", SOUTH: "S", WEST: "W"}
 ORIENTATION_ANGLES = {NORTH: pi / 2, EAST: 0.0, SOUTH: -pi / 2, WEST: pi}
@@ -17,7 +17,7 @@ DIRECTION_VECTORS = {NORTH: (0, 1), EAST: (1, 0), SOUTH: (0, -1), WEST: (-1, 0)}
 
 @dataclass(slots=True)
 class Pose:
-    """Discrete pose on the grid."""
+    """Discrete pose on the grid. Dataclass used in KB"""
 
     x: int
     y: int
@@ -31,8 +31,6 @@ class KnowledgeBase:
     Core idea:
     - `occ[(x,y)]` stores occupancy only (UNKNOWN/FREE/OCC).
     - Robot/goal/box are stored as separate fields (not encoded into occ).
-    - Mapping/sensor interpretation (e.g., LiDAR ray tracing) lives outside the KB
-      and should call `mark_free`/`mark_occupied` rather than embedding update rules here.
     """
 
     def __init__(self):
@@ -41,11 +39,8 @@ class KnowledgeBase:
         self.robot: Optional[Pose] = None
         self.goal: Optional[tuple[int, int]] = None
         self.box: Optional[tuple[int, int]] = None
-        # Optional finite bounds in grid coordinates (inclusive):
-        # (min_x, max_x, min_y, max_y). If set, any out-of-bounds cell is treated
-        # as OCC / non-traversable and mapping updates outside are ignored.
-        self.bounds: Optional[tuple[int, int, int, int]] = None
 
+    # TODO I think we need to remove the set bounds function to be exactly alligned with room KB? Or it does not have influence on acutal robot only helps us in debugging purpuses?
     def set_bounds(self, min_x: int, max_x: int, min_y: int, max_y: int) -> None:
         """Set finite grid bounds for planning/mapping (inclusive)."""
         if min_x > max_x or min_y > max_y:
@@ -53,7 +48,7 @@ class KnowledgeBase:
         self.bounds = (min_x, max_x, min_y, max_y)
 
     def in_bounds(self, x: int, y: int) -> bool:
-        """Return True if (x,y) is within bounds (or if bounds are not set)."""
+        """Helper to return True if (x,y) is within bounds (or if bounds are not set)."""
         if self.bounds is None:
             return True
         min_x, max_x, min_y, max_y = self.bounds
@@ -71,7 +66,8 @@ class KnowledgeBase:
         self, x_meters: float, y_meters: float, yaw_radians: float, cell_size: float
     ) -> None:
         """
-        Update robot pose from continuous measurements (real odometry).
+        Update robot pose from continuous measurements (real odometry). Even tough the robot has capability of turning directly to specifc angles
+        We will only allow 4 directions of movment for pathfinding algorithms.
 
         Converts continuous (x, y, yaw) to discrete grid pose.
         - Grid cell = round((meters - cell_size/2) / cell_size)
@@ -149,14 +145,11 @@ class KnowledgeBase:
         """Set/overwrite the box cell."""
         if not self.in_bounds(x, y):
             # Ignore obviously-invalid localization results instead of poisoning the KB.
+            # TODO - I Think this should not be here because we are doing SLAM? And we dont know the bounds fo the room?
             return
         self.box = (x, y)
-        # IMPORTANT: The box is a dynamic object, not a static obstacle.
-        # Do NOT encode it into the occupancy grid, otherwise the box leaves behind
-        # "ghost walls" when it moves. Path planning already treats `self.box` as
-        # non-traversable via `is_traversable()`.
-        #
-        # Mark as FREE so a previously-mistaken OCC does not persist.
+        # The box is a dynamic object, not a static obstacle. So we do nOT encode it into the occupancy grid, otherwise the box leaves behind
+        # "ghost walls" when it moves. Path planning already treats `self.box` as non-traversable via `is_traversable()`.
         self.mark_free(x, y)
 
     def move_box(self, new_x: int, new_y: int) -> None:
@@ -175,9 +168,7 @@ class KnowledgeBase:
         """Clear box knowledge (does not modify occupancy)."""
         self.box = None
 
-    # -------------------------------------------------------------------------
-    # Convenience properties (avoid verbose access like kb.robot.x)
-    # -------------------------------------------------------------------------
+    # Convenience properties
 
     @property
     def robot_x(self) -> int:
@@ -212,9 +203,7 @@ class KnowledgeBase:
     def goal_y(self) -> int | None:
         return None if self.goal is None else self.goal[1]
 
-    # -------------------------------------------------------------------------
     # Convenience methods
-    # -------------------------------------------------------------------------
 
     def get_cell_ahead(self) -> tuple[int, int]:
         """Get grid cell directly ahead of robot."""
@@ -326,7 +315,7 @@ class KnowledgeBase:
                     fr.add((nx, ny))
         return fr
 
-    # Debug output
+    # Helper Debug output
     def to_ascii(self, *, pad: int = 1) -> str:
         """
         Render a small ASCII map of known cells, including robot/goal/box overlay.
